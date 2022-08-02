@@ -602,11 +602,12 @@ class RRTBase:
         #node_new = node_near.copy()
         #node_new.assign_numpy(q_new)
         
-        if not self.domain.is_collision(self.mode, Config(node_new.q)):
-            self.get_FK(node_new)
-            return node_new
-        else:
-            return None
+        with self.domain.world.no_rendering():
+            if not self.domain.is_collision(self.mode, Config(node_new.q)):
+                self.get_FK(node_new)
+                return node_new
+            else:
+                return None
             
     def distance(self, node1:Node2, node2:Node2):
         return (node1 - node2).norm()

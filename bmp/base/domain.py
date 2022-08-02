@@ -1,5 +1,5 @@
 from pybullet_suite import *
-from utils.utils import *
+from ..utils.utils import *
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from itertools import product
@@ -21,6 +21,7 @@ class TAMPDomain:
         self.set_tamp_objects(movables, regions, robots)
         self.set_init_mode_config()
         self.envs = envs
+        self.domain_pddl = None
 
     @property
     def objects(self):

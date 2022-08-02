@@ -1,3 +1,7 @@
+# For this repo
+temp_pddl/
+found_plans/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
