@@ -1,6 +1,10 @@
 # For this repo
 temp_pddl/
 found_plans/
+examples/
+pddlstream_module/
+*.STL
+*.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

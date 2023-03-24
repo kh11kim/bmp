@@ -4,3 +4,9 @@
 [submodule "symk"]
 	path = symk
 	url = https://github.com/speckdavid/symk.git
+[submodule "pddlstream"]
+	path = pddlstream
+	url = https://github.com/kh11kim/pddlstream.git
+[submodule "pyperplan"]
+	path = pyperplan
+	url = https://github.com/aibasel/pyperplan.git
