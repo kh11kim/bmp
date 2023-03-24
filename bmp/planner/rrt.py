@@ -564,12 +564,14 @@ class RRTBase:
     def __init__(
         self,
         eps: float = 0.2,
+        ts_eps: float = 0.02, #task space epsilon
         p_goal: float = 0.2,
         max_iter: int = 100,
         q_delta_max: float = 0.1,
         DLS_damping: float = 0.1
     ):
         self.eps = eps
+        self.ts_eps = ts_eps
         self.p_goal = p_goal
         self.max_iter = max_iter
         self.q_delta_max = q_delta_max
@@ -585,13 +587,13 @@ class RRTBase:
         self.domain = domain
         self.robots: Dict[str, Panda] = {}
         for robot in robot_names:
-            self.robots[robot] = self.domain.robots[robot]
+            self.robots[robot] = domain.robots[robot]
         self.mode = mode
     
     def get_random_node(self) -> Node2:
         q = {}
         for robot_name in self.robots:
-            value = self.robots[robot_name].get_random_arm_angles()
+            value = self.robots[robot_name].get_random_joint_angles()
             q[robot_name] = value
         return Node2(q)
     
@@ -599,15 +601,12 @@ class RRTBase:
         node_err = node_rand - node_near
         node_delta = self.limit_step_size(node_err, self.q_delta_max)
         node_new = node_near + node_delta
-        #node_new = node_near.copy()
-        #node_new.assign_numpy(q_new)
         
-        with self.domain.world.no_rendering():
-            if not self.domain.is_collision(self.mode, Config(node_new.q)):
-                self.get_FK(node_new)
-                return node_new
-            else:
-                return None
+        if not self.domain.is_collision(self.mode, Config(node_new.q)):
+            self.get_FK(node_new)
+            return node_new
+        else:
+            return None
             
     def distance(self, node1:Node2, node2:Node2):
         return (node1 - node2).norm()
@@ -630,9 +629,95 @@ class RRTBase:
         
         if len(tcp) == 2:
             node.tcp_dist = np.linalg.norm(tcp[0] - tcp[1])
+    
+    def check_mode_switch(
+        self, 
+        target_robot_name: List[str],
+        config_curr: Config,
+        pose_target: Pose,
+        mode: Mode,
+        domain: TAMPDomain,
+        col_check:bool = True
+    ):
+        self.init(target_robot_name, domain, mode)
+        node_curr = Node2(config_curr.q)
+
+        traj = []
+        robot_name = list(self.robots.keys())[0]
+        #with self.domain.world.no_rendering():
+        for _ in range(10):
+            q_old = node_curr.q[robot_name]
+            node_curr.T[robot_name] = self.robots[robot_name].forward_kinematics(q_old)
+            node_new = self.move_tspace(robot_name,node_curr,pose_target)
+            if col_check:
+                if self.domain.is_collision(self.mode, Config(node_new.q), ignore_movables=True):
+                    return None
+            self.get_FK(node_new)
+            traj.append(node_new)
+            if distance_ts(node_new.T[robot_name], pose_target) < self.ts_eps:
+                result = [Config(node.q) for node in traj]
+                return result
+            node_curr = node_new
+        return None
+    
+    def move_tspace(
+        self, 
+        robot_name: str,
+        node_curr: Node2, 
+        pose_target: Pose,
+    ):
+        damping = 0.1
+        q_curr: np.ndarray = node_curr.q[robot_name]
+        pose_curr: Pose = node_curr.T[robot_name]
+
+        pos_err = pose_target.trans - pose_curr.trans
+        orn_err = orn_error(pose_target.rot.as_quat(), pose_curr.rot.as_quat())
+        err = np.hstack([pos_err, orn_err*2])
+
+        jac = self.robots[robot_name].get_jacobian(q_curr)
+        lmbda = np.eye(6) * damping ** 2
+        jac_pinv = jac.T @ np.linalg.inv(jac @ jac.T + lmbda)
+        node_delta = node_curr.copy()
+        node_delta.q[robot_name] = jac_pinv @ err
+        node_delta = self.limit_step_size(node_delta, q_delta_max=0.05)
+        node_new = node_curr + node_delta
+        return node_new
+        
+    
+    def smoothing(self, path: List[Node2], max_iter=50):
+        def is_path_collision(path):
+            with self.domain.no_assign():
+                for node in path:
+                    if self.domain.is_collision(self.mode, Config(node.q)):
+                        return True
+            return False
+        
+        if isinstance(path[0], Config):
+            smoothed_path = [Node2(config.q) for config in path]
+        
+        for _ in range(max_iter):
+            if len(smoothed_path) <= 2:
+                return smoothed_path
+            i, j = np.random.randint(0, len(smoothed_path)-1, size=2)
+            if abs(i - j) <= 1: continue
+            if j < i: (i, j) = (j, i)
+            
+            shortcut = self.direct_path(smoothed_path[i], smoothed_path[j])
+            if (len(shortcut) < (j - i)) and (not is_path_collision(shortcut)):
+                smoothed_path = smoothed_path[:i+1] + shortcut + smoothed_path[j+1:]
+        
+        return [Config(node.q) for node in smoothed_path]                
+
+    def direct_path(self, node1:Node2, node2:Node2)->List[Node2]:
+        #direct path without collision check
+        delta = node2 - node1
+        num = np.ceil(delta.norm() / self.q_delta_max).astype(int)
+        rr = np.linspace(0, 1, num, endpoint=True)
+        path = [node1 + delta*r for r in rr]
+        return path
 
 class BiRRT2(RRTBase):
-    """Dual arm RRT
+    """RRT for many robots
 
     Args:
         RRTBase (_type_): _description_
@@ -640,12 +725,13 @@ class BiRRT2(RRTBase):
     def __init__(
         self,
         eps: float = 0.2,
+        ts_eps: float = 0.02,
         p_goal: float = 0.2,
         max_iter: int = 100,
-        q_delta_max: float = 0.4,
+        q_delta_max: float = 0.1,
         DLS_damping: float = 0.1,
     ):
-        super().__init__(eps, p_goal, max_iter, q_delta_max, DLS_damping)
+        super().__init__(eps, ts_eps, p_goal, max_iter, q_delta_max, DLS_damping)
         
 
     def plan(
@@ -654,29 +740,84 @@ class BiRRT2(RRTBase):
         config_init: Config, 
         config_goal: Config,
         mode: Mode,
-        domain: TAMPDomain
+        domain: TAMPDomain,
+        only_fixed = False, #if none, all movables
     ):
+    
+        if domain.is_collision(mode, config_init, only_fixed=only_fixed): return None
+        if domain.is_collision(mode, config_goal, only_fixed=only_fixed): return None
+        
         self.init(target_robot_name, domain, mode)
-
         self.config_init = config_init
         self.config_goal = config_goal
         root_start = Node2(self.config_init.q)
         root_goal = Node2(self.config_goal.q)
+
+        is_direct_path = True
+        direct_path = self.direct_path(root_start, root_goal)
+        for node in direct_path:
+            if domain.is_collision(mode, Config(node.q), only_fixed=only_fixed):
+                is_direct_path = False
+                break
+        if is_direct_path:
+            return [Config(node.q) for node in direct_path]
+        
         self.tree_start = Tree2(root_start)
         self.tree_goal = Tree2(root_goal)
         
-        tree_a = self.tree_start
-        tree_b = self.tree_goal
+        # tree_a = self.tree_start
+        # tree_b = self.tree_goal
+        #with self.domain.world.no_rendering():
+
         for i in range(self.max_iter):
+            # tree_a, tree_b = self.tree_start, self.tree_goal
+            # if len(self.tree_start) >= len(self.tree_goal):
+            #     tree_a, tree_b = tree_b, tree_a
+                
+            # node_rand = self.get_random_node()
+            
+            # if not self.extend(tree_a, node_rand) == "trapped":
+            #     if self.connect(tree_b, tree_a.prev_node) == "reached":
+            #         forward_path = self.tree_start.backtrack(self.tree_start.prev_node)
+            #         backward_path =self.tree_goal.backtrack(self.tree_goal.prev_node)[::-1]
+            #         path = [*forward_path, *backward_path]
+            #         return [Config(node.q) for node in path]
+            is_fwd = True
+            tree_a, tree_b = self.tree_start, self.tree_goal
+            if len(self.tree_start) >= len(self.tree_goal):
+                is_fwd = False
+                tree_a, tree_b = tree_b, tree_a
             node_rand = self.get_random_node()
-            if not self.extend(tree_a, node_rand) == "trapped":
-                if self.connect(tree_b, tree_a.prev_node) == "reached":
-                    forward_path = self.tree_start.backtrack(self.tree_start.prev_node)
-                    backward_path =self.tree_goal.backtrack(self.tree_goal.prev_node)[::-1]
-                    path = [*forward_path, *backward_path]
-                    return [Config(node.q) for node in path]
-            (tree_a, tree_b) = (tree_b, tree_a)
-        return []
+            node_near_a = tree_a.nearest_cs(node_rand)
+            paths = self.direct_path(node_near_a, node_rand)
+            for node in paths:
+                if self.domain.is_collision(self.mode, Config(node.q), only_fixed=only_fixed): break
+                tree_a.add_node(node, node_near_a)
+                node_near_a = node
+            
+            node_near_b = tree_b.nearest_cs(node_near_a.copy())
+            is_connected = True
+            paths = self.direct_path(node_near_b, node_near_a.copy())
+            for node in paths:
+                if self.domain.is_collision(self.mode, Config(node.q), only_fixed=only_fixed): 
+                    is_connected = False
+                    break
+                tree_b.add_node(node, node_near_b)
+                node_near_b = node
+            
+            if is_connected:
+                node_fwd, node_bwd = node_near_a, node_near_b
+                if is_fwd == False:
+                    node_fwd, node_bwd = node_bwd, node_fwd
+                forward_path = self.tree_start.backtrack(node_fwd)
+                backward_path =self.tree_goal.backtrack(node_bwd)[::-1]
+                path = [*forward_path, *backward_path]
+                return [Config(node.q) for node in path]
+            else:
+                (tree_a, tree_b) = (tree_b, tree_a)
+            
+            
+        return None
 
     def extend(self, tree: Tree2, node_rand: Node2):
         tree.prev_node = None
@@ -698,6 +839,7 @@ class BiRRT2(RRTBase):
             result = self.extend(tree, node)
         return result
 
+    
 
 # class BiIKRRT(RRTBase):
 #     """ Planner for Handover

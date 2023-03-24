@@ -1,8 +1,9 @@
 from pybullet_suite import *
 from copy import deepcopy
-from dataclasses import dataclass, field
+from typing import Union, Callable, ClassVar
+from dataclasses import dataclass, field 
 
-PRE_POSE_DISTANCE = 0.05
+PRE_POSE_DISTANCE = 0.1
 
 @dataclass
 class SOP:
@@ -24,19 +25,46 @@ class Attachment:
     obj_name: str
     tf: Pose
     parent_name: Optional[str] = field(default_factory=lambda : None)
+    pre_pose_distance: Optional[float] = field(default_factory=lambda : PRE_POSE_DISTANCE)
 
     @staticmethod
     def get_pre_pose(pose:Pose):
         raise NotImplementedError()
+    
+    # def __lt__(self, other):
+    #     return self.fail < other.fail
+    
+    def __eq__(self, other):
+        return (self.parent_name == other.parent_name) and \
+            (self.obj_name == other.obj_name) and \
+            (self.tf == other.tf)
+
 
 @dataclass
 class Grasp(Attachment):
     width: Optional[float] = field(default_factory=lambda : 0)
+    approach: str = field(default_factory=lambda :"top")
+    pre_pose: Optional[Pose] = field(default_factory=lambda :None)
+    
+    def __post_init__(self):
+        if self.approach == "top":
+            self.pre_pose = Pose(trans=[0,0,+self.pre_pose_distance])
+        elif self.approach == "side":
+            self.pre_pose = Pose(trans=[0,0,-self.pre_pose_distance])
 
-    @staticmethod
-    def get_pre_pose(pose:Pose):
-        pre_pose = Pose(trans=[0,0,-PRE_POSE_DISTANCE])
-        return pose * pre_pose
+    def __repr__(self):
+        return f"Grasp:"
+
+    def get_pre_pose(self, pose:Pose, approach = None):
+        if approach is None:
+            approach = self.approach
+        if approach == "top":
+            return self.pre_pose * pose
+        elif approach == "side":
+            return pose * self.pre_pose
+    
+    def __hash__(self):
+        return f"Grasp:{self.obj_name}_{self.parent_name}_{self.tf.as_1d_numpy()}"
 
 @dataclass
 class Placement(Attachment):
@@ -45,10 +73,15 @@ class Placement(Attachment):
     yaw: Optional[float] = field(default_factory=lambda : None)
     obj_pose: Optional[Pose] = field(default_factory=lambda : None)
 
-    @staticmethod
-    def get_pre_pose(pose: Pose):
-        pre_pose = Pose(trans=[0,0,+PRE_POSE_DISTANCE])
+    def get_pre_pose(self, pose: Pose):
+        pre_pose = Pose(trans=[0,0,+self.pre_pose_distance])
         return pre_pose * pose
+
+    def __repr__(self):
+        return f"Placement:"
+    
+    def __hash__(self):
+        return f"Placement:{self.obj_name}_{self.parent_name}_{self.tf.as_1d_numpy()}"
 
     @classmethod
     def from_point_and_sop(
@@ -79,23 +112,34 @@ class Mode:
     """ All attachments of movables
     """
     def __init__(self, atts: Dict[str, Attachment]):
-        self._attachments: Dict[str, Attachment] = atts
-        self.mode_key = self.get_mode_key(atts)
-        
-    @property
-    def attachments(self):
-        return deepcopy(self._attachments)
+        self.attachments: Dict[str, Attachment] = atts
+        self.mode_key: Dict[str, Tuple[str, np.ndarray]] = self.get_mode_key(atts)
 
-    @attachments.setter
-    def attachments(self, atts:Dict[str, Attachment]):
-        self._attachments = atts
-        self.mode_key = self.get_mode_key(atts)
+    def set_attachment(self, att:Attachment):
+        self.attachments[att.obj_name] = att
+        self.mode_key = self.get_mode_key(self.attachments)
+
+    def __repr__(self):
+        s = "_".join([obj+"-"+key[0] for obj, key in self.mode_key.items()])
+        return f"Mode: {s}"
 
     def get_mode_key(self, atts:Dict[str, Attachment]):
         mode_key = {}
         for obj, att in atts.items():
             mode_key[obj] = (att.parent_name, att.tf.as_1d_numpy())
         return mode_key
+    
+    def get_hashable_key(self):
+        temp = []
+        for obj, att in sorted(self.attachments.items()):
+            temp += [obj, att.__hash__()]
+        return "_".join(temp)
+    
+    def as_1d_numpy(self):
+        names = np.sort(list(self.attachments.keys()))
+        array = np.concatenate([self.attachments[name].tf.as_1d_numpy() for name in names])
+        return array
+
 
     @classmethod
     def from_list(cls, att_list: List[Attachment]):
@@ -142,7 +186,6 @@ class Movable(TAMPObject):
         physics_client: BulletClient,
         body_uid: int,
         name: str,
-        grasps: List[Grasp],
         sops: List[SOP],
         sssp: SSSP
     ):
@@ -152,17 +195,28 @@ class Movable(TAMPObject):
             name=name,
             sssp=sssp
         )
-        self.grasps: List[Grasp] = grasps
         # Stable Object Poses : (Rotation, axis of rotation: R3, distance to a sssp: R1)
         self.sops: List[SOP] = sops
         
     @classmethod
-    def from_body(cls, body: Body, name: str, grasps, sops, sssp):
-        return cls(body.physics_client, body.uid, name, grasps, sops, sssp)
+    def from_body(cls, body: Body, name: str, sops, sssp):
+        return cls(body.physics_client, body.uid, name, sops, sssp)
     
+    def set_grasps(self, grasps:Union[List, Callable]):
+        if isinstance(grasps, List):
+            self.grasps = grasps
+            self.grasp_type = "discrete"
+        else:
+            #assume continuous grasp (function)
+            self.grasp_gen_fn: Callable[[],Grasp] = grasps
+            self.grasp_type = "continuous"
+        
     def sample_grasp(self):
-        i = np.random.randint(0, len(self.grasps))
-        return deepcopy(self.grasps[i])
+        if self.grasp_type == "discrete":
+            i = np.random.randint(0, len(self.grasps))
+            return deepcopy(self.grasps[i])
+        elif self.grasp_type == "continuous":
+            return self.grasp_gen_fn()
     
     def sample_sop(self):
         """Stable object pose
@@ -190,6 +244,14 @@ class Region(TAMPObject):
     def from_body(cls, body: Body, name: str, sssp: SSSP):
         return cls(body.physics_client, body.uid, name, sssp)
 
+
 @dataclass
-class Config:
+class Config:    
     q: Dict[str, np.ndarray]
+    robot_names: ClassVar[List[str]] = []
+    
+    def __repr__(self):
+        return f"Config:"
+
+    def set_q(self, robot_name, value:np.ndarray):
+        self.q[robot_name] = value

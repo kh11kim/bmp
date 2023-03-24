@@ -26,21 +26,30 @@ class Checker:
         else:
             raise ValueError()
     
-    def check_edge_ik(self, att1: Attachment, att2: Attachment, robot_base_pose: Pose=Pose.identity()) -> bool:
+    def check_edge_ik(
+        self, att1: Attachment, att2: Attachment, 
+        robot_base_pose: Pose=Pose.identity()
+    ) -> bool:
         if type(att1) != type(att2):
             if type(att1) is Placement:
                 obj_pose = att1.obj_pose
+                placement = att1
                 grasp = att2
             else:
                 obj_pose = att2.obj_pose
                 grasp = att1
+                placement = att2
             ee_pose = obj_pose * grasp.tf
-            ee_pre_pose = grasp.get_pre_pose(ee_pose)
-            grasp_pose_sim = robot_base_pose.inverse() * ee_pre_pose
-            q_pre_ik = self.robot.inverse_kinematics(pose=grasp_pose_sim)
-            if q_pre_ik is not None:
-                return (q_pre_ik, ee_pose)
-            return None
+            
+            #ee_pre_pose = grasp.get_pre_pose(ee_pose)
+            grasp_pose = robot_base_pose.inverse() * ee_pose
+            grasp_pose_pre = grasp.get_pre_pose(grasp_pose)
+            
+            q_pre_ik = self.robot.inverse_kinematics(pose=grasp_pose_pre)
+            if q_pre_ik is None: return None
+            q_ik = self.robot.inverse_kinematics(pose=grasp_pose)
+            if q_ik is None: return None
+            return (q_pre_ik, q_ik, ee_pose)
         elif type(att1) is Grasp:
             return None
         else:
